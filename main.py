@@ -19,15 +19,12 @@ BOT_MODE = os.getenv("BOT_MODE", "draft").strip().lower()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/bot.sqlite3")
 PROMPT_PATH = os.getenv("PROMPT_PATH", "data/PROMPT.md")
 KNOWLEDGE_PATH = os.getenv("KNOWLEDGE_PATH", "data/KNOWLEDGE.md")
-RECENT_MESSAGES_LIMIT = int(os.getenv("RECENT_MESSAGES_LIMIT", "20"))
-SEARCH_MESSAGES_LIMIT = int(os.getenv("SEARCH_MESSAGES_LIMIT", "8"))
+RECENT_MESSAGES_LIMIT = int(os.getenv("RECENT_MESSAGES_LIMIT", "30"))
+SEARCH_MESSAGES_LIMIT = int(os.getenv("SEARCH_MESSAGES_LIMIT", "12"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.55"))
 MANUAL_TAKEOVER_MINUTES = int(os.getenv("MANUAL_TAKEOVER_MINUTES", "30"))
 
-# 0 = не спамить собеседнику handoff-фразами.
 SEND_HANDOFF_TO_CHAT = os.getenv("SEND_HANDOFF_TO_CHAT", "0").strip() == "1"
-
-# 1 = тревожить владельца только при реально критичных ситуациях.
 OWNER_NOTIFY_CRITICAL_ONLY = os.getenv("OWNER_NOTIFY_CRITICAL_ONLY", "1").strip() != "0"
 
 
@@ -136,13 +133,22 @@ def save_message(
     conn.commit()
 
 
-def recent_messages(conn: sqlite3.Connection, chat_id: str, limit: int) -> str:
+def recent_message_rows(conn: sqlite3.Connection, chat_id: str, limit: int) -> list[sqlite3.Row]:
     rows = conn.execute(
-        "SELECT sender_type, text FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT ?",
+        "SELECT sender_type, text, created_at FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT ?",
         (chat_id, limit),
     ).fetchall()
-    rows = list(reversed(rows))
-    return "\n".join(f"{r['sender_type']}: {r['text']}" for r in rows) if rows else "Нет недавней истории."
+    return list(reversed(rows))
+
+
+def format_rows(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return "Нет недавней истории."
+    return "\n".join(f"{r['sender_type']}: {r['text']}" for r in rows)
+
+
+def recent_messages(conn: sqlite3.Connection, chat_id: str, limit: int) -> str:
+    return format_rows(recent_message_rows(conn, chat_id, limit))
 
 
 def search_messages(conn: sqlite3.Connection, chat_id: str, query: str, limit: int) -> str:
@@ -154,7 +160,7 @@ def search_messages(conn: sqlite3.Connection, chat_id: str, query: str, limit: i
     try:
         rows = conn.execute(
             """
-            SELECT m.sender_type, m.text
+            SELECT m.sender_type, m.text, m.created_at
             FROM messages_fts f
             JOIN messages m ON m.id = f.rowid
             WHERE messages_fts MATCH ? AND m.chat_id=?
@@ -165,11 +171,11 @@ def search_messages(conn: sqlite3.Connection, chat_id: str, query: str, limit: i
         ).fetchall()
     except sqlite3.OperationalError:
         rows = conn.execute(
-            "SELECT sender_type, text FROM messages WHERE chat_id=? AND lower(text) LIKE ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT sender_type, text, created_at FROM messages WHERE chat_id=? AND lower(text) LIKE ? ORDER BY created_at DESC LIMIT ?",
             (chat_id, f"%{terms[0]}%", limit),
         ).fetchall()
 
-    return "\n".join(f"{r['sender_type']}: {r['text']}" for r in rows) if rows else "Ничего не найдено."
+    return format_rows(list(rows)) if rows else "Ничего не найдено."
 
 
 # -------------------- Telegram --------------------
@@ -200,7 +206,7 @@ async def notify_owner(text: str) -> None:
         await send_message(OWNER_TELEGRAM_ID, text)
 
 
-# -------------------- AI --------------------
+# -------------------- AI and local replies --------------------
 
 def read_file(path: str) -> str:
     p = Path(path)
@@ -218,20 +224,74 @@ def is_critical(text: str) -> bool:
     return any(p in t for p in critical_patterns)
 
 
+def summarize_recent_context(rows: list[sqlite3.Row]) -> str:
+    texts = [str(r["text"]).strip() for r in rows if str(r["text"]).strip()]
+    if not texts:
+        return "Да особо ни о чём, история пустая."
+
+    joined = " ".join(texts[-8:]).lower()
+    topics: list[str] = []
+
+    if any(w in joined for w in ["гулять", "погулять", "вечером", "встретиться", "встреч"]):
+        topics.append("прогулку вечером")
+    if any(w in joined for w in ["китай", "гитлер", "россия", "сша", "полит"]):
+        topics.append("тот странный политический вброс")
+    if any(w in joined for w in ["сосал", "напиши", "если сос"]):
+        topics.append("подколы")
+    if any(w in joined for w in ["привет", "как дела", "что делаешь"]):
+        topics.append("обычную болтовню")
+    if any(w in joined for w in ["бильярд"]):
+        topics.append("бильярд")
+    if any(w in joined for w in ["зал", "трен", "качал"]):
+        topics.append("зал")
+
+    if topics:
+        if len(topics) == 1:
+            return f"Да про {topics[0]} говорили."
+        return "Да буквально про " + ", ".join(topics[:-1]) + " и " + topics[-1] + "."
+
+    # Fallback: mention last meaningful user message.
+    for r in reversed(rows):
+        if r["sender_type"] == "user":
+            msg = str(r["text"]).strip()
+            if len(msg) > 120:
+                msg = msg[:117] + "..."
+            return f"Да вот про это: “{msg}”."
+
+    return "Да особо ни о чём серьёзном, просто переписывались."
+
+
+def context_reply(text: str, rows: list[sqlite3.Row]) -> str | None:
+    t = (text or "").lower().strip()
+
+    if any(p in t for p in [
+        "о чем мы", "о чём мы", "что мы обсуждали", "про что мы", "о чем говорили", "о чём говорили",
+        "что я спрашивал", "что я спросил", "что было до этого", "о чем речь", "о чём речь",
+    ]):
+        return summarize_recent_context(rows)
+
+    if t in {"почему", "почему?", "в смысле", "в смысле?", "что именно", "что именно?"}:
+        recent = " ".join(str(r["text"]).lower() for r in rows[-6:])
+        if any(w in recent for w in ["китай", "гитлер", "россия", "сша"]):
+            return "Потому что это звучит как провокация, а не нормальный вопрос."
+        if any(w in recent for w in ["гулять", "погулять", "вечером"]):
+            return "Потому что по идее я не против, просто надо по времени понять."
+        return "Да я про последнее сообщение, там контекст немного странный вышел."
+
+    return None
+
+
 def local_reply(text: str) -> str | None:
-    """Локальная страховка для болтовни, троллинга и типовых фраз."""
     t = (text or "").lower().strip()
     if not t:
         return None
 
-    # Prompt injection / trolling
     if re.search(r"\b(напиши|повтори|скажи|ответь)\b", t) and ("если" in t or "сос" in t or "игнор" in t):
         return "Хорошая попытка, но нет."
 
     if "сосал" in t or "сосал?" in t:
         return "Ахах, мимо, это не по моей части."
 
-    # Weird political provocation. No lecture, no owner alert.
     if any(w in t for w in ["гитлер", "сша", "россия", "китай", "демократическая республика"]):
         return "Бро, это какой-то тест на адекватность? Я в такие политические комбо не лезу."
 
@@ -246,7 +306,6 @@ def local_reply(text: str) -> str | None:
     if "что дела" in t or "чем занят" in t:
         return "Да так, немного в делах. А ты что?"
 
-    # Important: do not catch phrases like “как ты смотришь на...”.
     if re.fullmatch(r".*\b(как дела|как ты|как сам|как жизнь)\??", t):
         return "Да нормально, в целом живём. У тебя как?"
 
@@ -273,11 +332,6 @@ def parse_ai_json(raw: str) -> dict[str, Any]:
 
 
 async def ask_gemini(incoming_text: str, recent_context: str, relevant_memory: str, user_info: str) -> dict[str, Any]:
-    # Local replies go first for obvious casual/troll cases.
-    fallback = local_reply(incoming_text)
-    if fallback:
-        return {"action": "reply", "confidence": 0.95, "answer": fallback, "reason": "local reply", "critical": False}
-
     if not GEMINI_API_KEY:
         if is_critical(incoming_text):
             return {"action": "handoff", "confidence": 1.0, "answer": "", "reason": "critical without AI", "critical": True}
@@ -302,6 +356,7 @@ async def ask_gemini(incoming_text: str, recent_context: str, relevant_memory: s
 
 Правила:
 - В 95% обычных сообщений выбирай action="reply".
+- Внимательно используй недавнюю историю чата. Если спрашивают “о чём мы говорили?”, “почему?”, “что я спросил?”, отвечай по истории.
 - Handoff делай только при реально критичных ситуациях: угрозы, самоповреждение, серьёзный конфликт, деньги, долг, документы, юридические проблемы, точные обязательства от имени владельца.
 - Странные политические вопросы, тупой троллинг, мемы, подколы и провокации НЕ являются critical. На них отвечай коротко, иронично или уходи от темы.
 - Вопросы про прогулку/встречу обычно НЕ critical: можно сказать, что звучит норм, но нужно глянуть по времени.
@@ -348,7 +403,6 @@ async def ask_gemini(incoming_text: str, recent_context: str, relevant_memory: s
         raw = data["candidates"][0]["content"]["parts"][0]["text"]
         decision = parse_ai_json(raw)
 
-        # Never let non-critical handoff bother the owner. Convert it into a soft reply.
         if str(decision.get("action", "")).lower() == "handoff" and not bool(decision.get("critical", False)):
             answer = str(decision.get("answer") or "Хз, тут надо чуть подумать.").strip()
             return {"action": "reply", "confidence": 0.7, "answer": answer, "reason": "converted non-critical handoff", "critical": False}
@@ -474,11 +528,20 @@ async def handle_business_message(message: dict[str, Any]) -> None:
         if mode == "silent":
             return
 
-        recent = recent_messages(conn, chat_id, RECENT_MESSAGES_LIMIT)
+        recent_rows = recent_message_rows(conn, chat_id, RECENT_MESSAGES_LIMIT)
+        recent = format_rows(recent_rows)
         memory = search_messages(conn, chat_id, text, SEARCH_MESSAGES_LIMIT)
 
-    user_info = f"chat_id={chat_id}; user_id={from_user_id}; username=@{user.get('username')}; first_name={user.get('first_name')}"
-    decision = await ask_gemini(text or "[non-text message]", recent, memory, user_info)
+    context_answer = context_reply(text, recent_rows)
+    if context_answer:
+        decision = {"action": "reply", "confidence": 0.97, "answer": context_answer, "reason": "local context reply", "critical": False}
+    else:
+        direct_answer = local_reply(text)
+        if direct_answer:
+            decision = {"action": "reply", "confidence": 0.95, "answer": direct_answer, "reason": "local reply", "critical": False}
+        else:
+            user_info = f"chat_id={chat_id}; user_id={from_user_id}; username=@{user.get('username')}; first_name={user.get('first_name')}"
+            decision = await ask_gemini(text or "[non-text message]", recent, memory, user_info)
 
     action = str(decision.get("action", "reply")).lower().strip()
     confidence = float(decision.get("confidence", 0) or 0)
@@ -495,7 +558,6 @@ async def handle_business_message(message: dict[str, Any]) -> None:
         )
         return
 
-    # Critical handoff: тревожим владельца. Собеседнику ничего деревянного не шлём.
     if action == "handoff" or critical:
         await notify_owner(
             f"🔴 Критичный handoff\n\nchat_id: {chat_id}\nСообщение: {text or '[non-text]'}\n\nЧерновик:\n{answer or '—'}\n\nconfidence: {confidence:.2f}\nreason: {reason or '—'}"
@@ -504,7 +566,6 @@ async def handle_business_message(message: dict[str, Any]) -> None:
             await send_message(chat_id, answer, business_connection_id)
         return
 
-    # Low confidence is not critical anymore. Try to answer anyway if there is an answer.
     if confidence < CONFIDENCE_THRESHOLD and not answer:
         answer = local_reply(text) or "Хз, тут надо чуть подумать."
 
@@ -551,7 +612,8 @@ async def handle_direct_command(message: dict[str, Any]) -> None:
                 f"paused: {get_setting(conn, 'global_paused', '0')}\n"
                 f"send_handoff_to_chat: {SEND_HANDOFF_TO_CHAT}\n"
                 f"owner_notify_critical_only: {OWNER_NOTIFY_CRITICAL_ONLY}\n"
-                f"confidence_threshold: {CONFIDENCE_THRESHOLD}"
+                f"confidence_threshold: {CONFIDENCE_THRESHOLD}\n"
+                f"recent_messages_limit: {RECENT_MESSAGES_LIMIT}"
             )
             return
 
